@@ -7,51 +7,90 @@ import vibe.core.stream;
 import vibe.http.websockets;
 import vibe.stream.operations;
 
-import virc;
+import virc : IRCMessage, Target, UserMask, VIRCChannel = Channel, VIRCUser = User;
+
+enum maxLineLength = 510;
 
 struct Client {
 	string id;
 	Stream stream;
 	WebSocket webSocket;
-	SysTime connected;
-	string defaultHost;
-	UserMask mask;
-	string realname;
+	bool sentUSER;
+	bool sentNICK;
 	bool registered;
-	this(string clientID, Stream userStream) @safe {
-		id = clientID;
-		stream = userStream;
-		connected = Clock.currTime;
-	}
-	this(string clientID, WebSocket socket) @safe {
-		id = clientID;
+	bool usingWebSocket;
+	bool waitForCapEnd;
+	bool supportsCap302;
+	bool supportsCapNotify;
+	this(WebSocket socket) @safe {
+		usingWebSocket = true;
 		webSocket = socket;
-		connected = Clock.currTime;
+	}
+	this(Stream socket) @safe {
+		usingWebSocket = false;
+		stream = socket;
+	}
+	string receive() @safe {
+		import std.string : assumeUTF;
+		if (usingWebSocket) {
+			return webSocket.receiveText();
+		} else {
+			return assumeUTF(stream.readUntil(['\r', '\n'], 512));
+		}
 	}
 	void send(const IRCMessage message) @safe {
-		logTrace("Sending message: %s", message.toString());
-		if (webSocket) {
+		logDebugV("Sending message: %s", message.toString());
+		if (usingWebSocket) {
 			webSocket.send(message.toString());
-		}
-		if (stream) {
+		} else {
 			stream.write(message.toString());
 			stream.write("\r\n");
 		}
 	}
-	void disconnect() @safe {
-		if (webSocket) {
-			webSocket.close();
-		}
-		if (stream) {
-			stream.finalize();
+	bool hasMoreData() @safe {
+		if (usingWebSocket) {
+			return webSocket.waitForData();
+		} else {
+			return !stream.empty;
 		}
 	}
 	bool meetsRegistrationRequirements() @safe const {
-		return ((mask.ident != "") && (mask.nickname != ""));
+		return sentUSER && sentNICK && !waitForCapEnd;
 	}
 }
 
-struct ServerChannel {
+struct User {
+	string randomID;
+	string account;
+	Client[string] clients;
+	SysTime connected;
+	string defaultHost;
+	UserMask mask;
+	string realname;
+	bool isAnonymous = true;
+	this(string userID, Client client) @safe {
+		randomID = userID;
+		clients[userID] = client;
+		connected = Clock.currTime;
+	}
+	void send(const IRCMessage message) @safe {
+		foreach (client; clients) {
+			client.send(message);
+		}
+	}
+	bool shouldCleanup() @safe const {
+		return isAnonymous && clients.length == 0;
+	}
+	auto accountID() @safe const {
+		assert(!isAnonymous, "Anonymous users don't have accounts");
+		return id;
+	}
+	auto id() @safe const {
+		return isAnonymous ? randomID : account;
+	}
+}
+
+struct Channel {
 	string name;
 	SysTime created;
 	string topic;
@@ -63,12 +102,16 @@ struct ServerChannel {
 }
 
 struct VIRCd {
-	Client[string] connections;
-	ServerChannel[string] channels;
+	import virc.ircv3.base : Capability;
+	User[string] connections;
+	Channel[string] channels;
 	string networkName = "Unnamed";
 	string serverName = "Unknown";
 	string serverVersion = "v0.0.0";
 	string networkAddress = "localhost";
+	Capability[] supportedCaps = [
+		Capability("cap-notify", "")
+	];
 	SysTime serverCreatedTime;
 
 	void init() @safe {
@@ -76,125 +119,188 @@ struct VIRCd {
 	}
 
 	void handleStream(Stream stream, string address) @safe {
-		import std.conv : text;
-		import std.random : uniform;
-		import std.string : assumeUTF;
-		auto clientID = uniform!ulong().text;
-		auto client = Client(clientID, stream);
-		client.defaultHost = address;
-		connections[clientID] = client;
-
-		logInfo("User connected: %s/%s", address, clientID);
-
-		while (!stream.empty) {
-			receive(assumeUTF(stream.readUntil(['\r', '\n'], 512)), clientID);
-		}
-		cleanup(clientID, "Connection reset by peer");
+		handleStream(Client(stream), address);
 	}
 	void handleStream(WebSocket stream, string address) @safe {
+		handleStream(Client(stream), address);
+	}
+	void handleStream(Client client, string address) @safe {
 		import std.conv : text;
 		import std.random : uniform;
-		import std.string : assumeUTF;
-		auto clientID = uniform!ulong().text;
-		auto client = Client(clientID, stream);
-		client.defaultHost = address;
-		connections[clientID] = client;
+		auto randomID = uniform!ulong().text;
+		client.id = randomID;
+		auto user = new User(randomID, client);
+		user.defaultHost = address;
 
-		logInfo("User connected: %s/%s", address, clientID);
+		logInfo("User connected: %s/%s", address, randomID);
 
-		while (stream.waitForData()) {
-			receive(stream.receiveText(), clientID);
+		while (client.hasMoreData) {
+			receive(client.receive(), *user, client);
+			if (user.id != randomID) {
+				user = user.id in connections;
+				client = user.clients[randomID];
+			}
 		}
-		cleanup(clientID, "Connection reset by peer");
+		cleanup(user.id, randomID, "Connection reset by peer");
 	}
-	void cleanup(string id, string message) @safe {
+	void cleanup(string id, string clientID, string message) @safe {
+		logInfo("Client disconnected: %s: %s", id, message);
 		if (id in connections) {
-			foreach (otherClient; subscribedUsers(Target(User(connections[id].mask.nickname)))) {
-				sendQuit(*otherClient, connections[id], message);
+			connections[id].clients.remove(clientID);
+			if (connections[id].shouldCleanup) {
+				foreach (otherUser; subscribedUsers(Target(VIRCUser(connections[id].mask.nickname)))) {
+					sendQuit(*otherUser, connections[id], message);
+				}
+				if (!connections.remove(id)) {
+					logWarn("Could not remove ID from connection list?");
+				}
 			}
-			connections[id].disconnect();
-			if (!connections.remove(id)) {
-				logTrace("Could not remove ID from connection list?");
-			}
+		} else {
+			logWarn("ID of user not found");
 		}
 	}
-	void receive(string str, string client) @safe {
+	void receive(string str, ref User thisUser, ref Client thisClient) @safe {
+		import std.algorithm.iteration : map;
+		import std.algorithm.searching : canFind;
 		import virc.ircmessage : IRCMessage;
-		auto thisClient = client in connections;
 		auto msg = IRCMessage.fromClient(str);
 		switch(msg.verb) {
+			case "CAP":
+				auto args = msg.args;
+				if (args.empty) {
+					break;
+				}
+				const subCommand = args.front;
+				args.popFront();
+				switch (subCommand) {
+					case "LS":
+						if (!args.empty && args.front == "302") {
+							thisClient.supportsCap302 = true;
+						}
+						thisClient.waitForCapEnd = true;
+						sendCapList(thisClient, thisClient.registered ? thisUser.mask.nickname : "*", "LS");
+						break;
+					case "LIST":
+						sendCapList(thisClient, thisClient.registered ? thisUser.mask.nickname : "*", "LIST");
+						break;
+					case "REQ":
+						Capability[] caps;
+						bool reject;
+						foreach (clientCap; args.front.splitter(" ").map!(x => Capability(x))) {
+							if (!supportedCaps.canFind(clientCap.name)) {
+								reject = true;
+								break;
+							}
+							caps ~= clientCap;
+						}
+						if (reject) {
+							sendCapNAK(thisClient, thisClient.registered ? thisUser.mask.nickname : "*", args.front);
+						} else {
+							sendCapACK(thisClient, thisClient.registered ? thisUser.mask.nickname : "*", args.front);
+						}
+						foreach (cap; caps) {
+							switch (cap) {
+								case "cap-notify":
+									thisClient.supportsCapNotify = !cap.isDisabled;
+									break;
+								default: assert(0, "Unsupported CAP ACKed???");
+							}
+						}
+						break;
+					case "END":
+						thisClient.waitForCapEnd = false;
+						if (!thisClient.registered && thisClient.meetsRegistrationRequirements) {
+							completeRegistration(thisClient, thisUser);
+						}
+						break;
+					default:
+						sendERRInvalidCapCmd(thisClient, thisClient.registered ? thisUser.mask.nickname : "*", subCommand);
+					break;
+				}
+				break;
 			case "NICK":
 				auto nickname = msg.args.front;
-				auto currentNickname = thisClient.mask.nickname;
+				auto currentNickname = thisUser.mask.nickname;
 				if (auto alreadyUsed = getUserByNickname(nickname)) {
-					if (alreadyUsed !is thisClient) {
-						sendERRNicknameInUse(*thisClient, nickname);
+					if (alreadyUsed.id != thisUser.id) {
+						sendERRNicknameInUse(thisUser, nickname);
 						break;
 					}
 				}
 				if (thisClient.registered) {
-					foreach (otherClient; subscribedUsers(Target(User(currentNickname)))) {
-						sendNickChange(*otherClient, *thisClient, nickname);
+					foreach (otherUser; subscribedUsers(Target(VIRCUser(currentNickname)))) {
+						sendNickChange(*otherUser, thisUser, nickname);
 					}
 				}
-				thisClient.mask.nickname = nickname;
+				thisUser.mask.nickname = nickname;
+				thisClient.sentNICK = true;
 				if (!thisClient.registered && thisClient.meetsRegistrationRequirements) {
-					completeRegistration(*thisClient);
+					completeRegistration(thisClient, thisUser);
 				}
 				break;
 			case "USER":
+				if (thisClient.registered) {
+					break;
+				}
 				auto args = msg.args;
-				thisClient.mask.ident = args.front;
+				thisUser.mask.ident = args.front;
 				args.popFront();
 				const unused = args.front;
 				args.popFront();
 				const unused2 = args.front;
 				args.popFront();
-				thisClient.realname = args.front;
+				thisUser.realname = args.front;
+				thisClient.sentUSER = true;
 				if (!thisClient.registered && thisClient.meetsRegistrationRequirements) {
-					completeRegistration(*thisClient);
+					completeRegistration(thisClient, thisUser);
 				}
 				break;
 			case "QUIT":
-				cleanup(client, msg.args.front);
+				cleanup(thisUser.id, thisClient.id, msg.args.front);
 				break;
 			case "JOIN":
-				void joinChannel(ref ServerChannel channel) @safe {
-					channel.users ~= client;
-					foreach (otherClient; subscribedUsers(Target(Channel(channel.name)))) {
-						sendJoin(*otherClient, *thisClient, channel.name);
+				if (!thisClient.registered) {
+					break;
+				}
+				void joinChannel(ref Channel channel) @safe {
+					channel.users ~= thisUser.id;
+					foreach (otherUser; subscribedUsers(Target(VIRCChannel(channel.name)))) {
+						sendJoin(*otherUser, thisUser, channel.name);
 					}
-					sendNames(*thisClient, channel);
+					sendNames(thisUser, channel);
 				}
 				auto channelsToJoin = msg.args.front.splitter(",");
 				foreach (channel; channelsToJoin) {
-					final switch (couldUserJoin(*thisClient, channel)) {
+					final switch (couldUserJoin(thisUser, channel)) {
 						case JoinAttemptResult.yes:
 							if (channel[0] != '#') {
 								channel = "#"~channel;
 							}
-							logTrace("%s joining channel %s", client, channel);
-							joinChannel(channels.require(channel, ServerChannel(channel)));
+							logDebugV("%s joining channel %s", thisUser.id, channel);
+							joinChannel(channels.require(channel, Channel(channel)));
 							break;
 						case JoinAttemptResult.illegalChannel:
-							sendERRNoSuchChannel(*thisClient, channel);
+							sendERRNoSuchChannel(thisUser, channel);
 							continue;
 					}
 				}
 				break;
 			case "PRIVMSG":
+				if (!thisClient.registered) {
+					break;
+				}
 				auto args = msg.args;
 				auto targets = args.front.splitter(",");
 				args.popFront();
 				auto message = args.front;
 				foreach (target; targets) {
 					if (auto user = getUserByNickname(target)) {
-						sendPrivmsg(*user, *thisClient, target, message);
+						sendPrivmsg(*user, thisUser, target, message);
 					} else {
 						if (target in channels) {
-							foreach (otherClient; subscribedUsers(Target(Channel(channels[target].name)))) {
-								if (otherClient !is thisClient) {
-									sendPrivmsg(*otherClient, *thisClient, target, message);
+							foreach (otherUser; subscribedUsers(Target(VIRCChannel(channels[target].name)))) {
+								if (otherUser.id != thisUser.id) {
+									sendPrivmsg(*otherUser, thisUser, target, message);
 								}
 							}
 						}
@@ -202,18 +308,21 @@ struct VIRCd {
 				}
 				break;
 			case "NOTICE":
+				if (!thisClient.registered) {
+					break;
+				}
 				auto args = msg.args;
 				auto targets = args.front.splitter(",");
 				args.popFront();
 				auto message = args.front;
 				foreach (target; targets) {
 					if (auto user = getUserByNickname(target)) {
-						sendNotice(*user, *thisClient, target, message);
+						sendNotice(*user, thisUser, target, message);
 					} else {
 						if (target in channels) {
-							foreach (otherClient; subscribedUsers(Target(Channel(channels[target].name)))) {
-								if (otherClient !is thisClient) {
-									sendNotice(*otherClient, *thisClient, target, message);
+							foreach (otherUser; subscribedUsers(Target(VIRCChannel(channels[target].name)))) {
+								if (otherUser.id != thisUser.id) {
+									sendNotice(*otherUser, thisUser, target, message);
 								}
 							}
 						}
@@ -225,37 +334,42 @@ struct VIRCd {
 				break;
 		}
 	}
-	void completeRegistration(ref Client client) @safe {
-		client.mask.host = client.defaultHost;
+	void completeRegistration(ref Client client, ref User user) @safe
+		in(client.meetsRegistrationRequirements, "Client does not meet registration requirements yet")
+		in(!client.registered, "Client already registered")
+	{
+		user.mask.host = user.defaultHost;
 		client.registered = true;
-		sendRPLWelcome(client);
-		sendRPLYourHost(client);
-		sendRPLCreated(client);
-		sendRPLMyInfo(client);
-		sendRPLISupport(client);
+		connections.require(user.id, user);
+		connections[user.id].clients[user.randomID] = client;
+		sendRPLWelcome(client, user.mask.nickname);
+		sendRPLYourHost(client, user.mask.nickname);
+		sendRPLCreated(client, user.mask.nickname);
+		sendRPLMyInfo(client, user.mask.nickname);
+		sendRPLISupport(client, user.mask.nickname);
 	}
 	auto subscribedUsers(Target target) @safe {
-		Client*[] result;
+		import std.algorithm.searching : canFind;
+		User*[] result;
 		if (target.isChannel) {
 			if (target.targetText in channels) {
-				foreach (client; channels[target.targetText].users) {
-					result ~= client in connections;
+				foreach (user; channels[target.targetText].users) {
+					result ~= user in connections;
 				}
 			}
-		}
-		if (target.isUser) {
+		} else if (target.isUser) {
 			string id;
-			foreach (client; connections) {
-				if (client.mask.nickname == target.targetText) {
-					id = client.id;
+			foreach (user; connections) {
+				if (user.mask.nickname == target.targetText) {
+					id = user.id;
 					break;
 				}
 			}
 			if (id != "") {
 				foreach (channel; channels) {
 					if (channel.users.canFind(id)) {
-						foreach (client; channel.users) {
-							result ~= client in connections;
+						foreach (user; channel.users) {
+							result ~= user in connections;
 						}
 					}
 				}
@@ -263,106 +377,182 @@ struct VIRCd {
 		}
 		return result;
 	}
-	void sendNames(ref Client client, const ServerChannel channel) @safe {
-		sendRPLNamreply(client, channel);
-		sendRPLEndOfNames(client, channel.name);
+	void sendNames(ref User user, const Channel channel) @safe {
+		sendRPLNamreply(user, channel);
+		sendRPLEndOfNames(user, channel.name);
 	}
-	void sendNickChange(ref Client client, const Client subject, string newNickname) @safe {
+	void sendNickChange(ref User user, const User subject, string newNickname) @safe {
 		import std.conv : text;
 		auto ircMessage = IRCMessage();
 		ircMessage.source = subject.mask.text;
 		ircMessage.verb = "NICK";
 		ircMessage.args = newNickname;
-		client.send(ircMessage);
+		user.send(ircMessage);
 	}
-	void sendJoin(ref Client client, ref Client subject, string channel) @safe {
+	void sendJoin(ref User user, ref User subject, string channel) @safe {
 		import std.conv : text;
 		auto ircMessage = IRCMessage();
 		ircMessage.source = subject.mask.text;
 		ircMessage.verb = "JOIN";
 		ircMessage.args = channel;
-		client.send(ircMessage);
+		user.send(ircMessage);
 	}
-	void sendQuit(ref Client client, ref Client subject, string msg) @safe {
+	void sendQuit(ref User user, ref User subject, string msg) @safe {
 		import std.conv : text;
 		auto ircMessage = IRCMessage();
 		ircMessage.source = subject.mask.text;
 		ircMessage.verb = "QUIT";
 		ircMessage.args = msg;
-		client.send(ircMessage);
+		user.send(ircMessage);
 	}
-	void sendPrivmsg(ref Client client, ref Client subject, string target, string message) @safe {
+	void sendPrivmsg(ref User user, ref User subject, string target, string message) @safe {
 		import std.conv : text;
 		auto ircMessage = IRCMessage();
 		ircMessage.source = subject.mask.text;
 		ircMessage.verb = "PRIVMSG";
 		ircMessage.args = [target, message];
-		client.send(ircMessage);
+		user.send(ircMessage);
 	}
-	void sendNotice(ref Client client, ref Client subject, string target, string message) @safe {
+	void sendNotice(ref User user, ref User subject, string target, string message) @safe {
 		import std.conv : text;
 		auto ircMessage = IRCMessage();
 		ircMessage.source = subject.mask.text;
 		ircMessage.verb = "NOTICE";
 		ircMessage.args = [target, message];
+		user.send(ircMessage);
+	}
+	void sendCapList(ref Client client, string nickname, string subCommand) @safe {
+		import std.array : empty;
+		import std.algorithm.iteration : map;
+		import std.string : join;
+		auto capsToSend = supportedCaps;
+		const capLengthLimit = maxLineLength - (networkAddress.length + 2) - "CAP ".length - (nickname.length + 1) - (subCommand.length + 3);
+		do {
+			size_t thisLength = 0;
+			size_t numCaps;
+			auto ircMessage = IRCMessage();
+			ircMessage.source = networkAddress;
+			ircMessage.verb = "CAP";
+			foreach (i, cap; capsToSend) {
+				thisLength += cap.name.length + 1;
+				if (client.supportsCap302) {
+					thisLength += cap.value.length+1;
+				}
+				if (thisLength > capLengthLimit) {
+					assert(i > 0, "CAP name way too long");
+					numCaps = i;
+					break;
+				}
+				if (i == capsToSend.length-1) {
+					numCaps = i + 1;
+					break;
+				}
+			}
+			string[] args;
+			args.reserve(4);
+			args ~= [nickname, subCommand];
+			assert((capsToSend.length == 0) || (numCaps > 0), "Unexpectedly sending zero caps");
+			if (client.supportsCap302) {
+				if (numCaps < capsToSend.length) {
+					args ~= "*";
+				}
+				args ~= capsToSend[0 .. numCaps].map!(x => x.toString).join(" ");
+			} else {
+				args ~= capsToSend[0 .. numCaps].map!(x => x.name).join(" ");
+			}
+			ircMessage.args = args;
+			client.send(ircMessage);
+			capsToSend = capsToSend[numCaps .. $];
+		} while(!capsToSend.empty);
+	}
+	void sendCapACK(ref Client client, string nickname, string capList) @safe {
+		auto ircMessage = IRCMessage();
+		ircMessage.source = networkAddress;
+		ircMessage.verb = "CAP";
+		ircMessage.args = [nickname, "ACK", capList];
 		client.send(ircMessage);
 	}
-	void sendRPLWelcome(ref Client client) @safe {
-		import std.format : format;
-		sendNumeric(client, 1, format!"Welcome to the %s Network, %s"(networkName, client.mask.nickname));
+	void sendCapNAK(ref Client client, string nickname, string capList) @safe {
+		auto ircMessage = IRCMessage();
+		ircMessage.source = networkAddress;
+		ircMessage.verb = "CAP";
+		ircMessage.args = [nickname, "NAK", capList];
+		client.send(ircMessage);
 	}
-	void sendRPLYourHost(ref Client client) @safe {
-		import std.format : format;
-		sendNumeric(client, 2, format!"Your host is %s, running version %s"(serverName, serverVersion));
+	void sendCapNEW(ref User user, string capList) @safe {
+		auto ircMessage = IRCMessage();
+		ircMessage.source = networkAddress;
+		ircMessage.verb = "CAP";
+		ircMessage.args = [user.mask.nickname, "NEW", capList];
+		user.send(ircMessage);
 	}
-	void sendRPLCreated(ref Client client) @safe {
-		import std.format : format;
-		sendNumeric(client, 3, format!"This server was created %s"(serverCreatedTime));
+	void sendCapDEL(ref User user, string capList) @safe {
+		auto ircMessage = IRCMessage();
+		ircMessage.source = networkAddress;
+		ircMessage.verb = "CAP";
+		ircMessage.args = [user.mask.nickname, "NEW", capList];
+		user.send(ircMessage);
 	}
-	void sendRPLMyInfo(ref Client client) @safe {
+	void sendRPLWelcome(ref Client client, const string nickname) @safe {
 		import std.format : format;
-		sendNumeric(client, 4, format!"%s %s %s"(serverName, serverVersion, "abcdefghijklmnopqrstuvwxyz"));
+		sendNumeric(client, nickname, 1, format!"Welcome to the %s Network, %s"(networkName, nickname));
 	}
-	void sendRPLISupport(ref Client client) @safe {
+	void sendRPLYourHost(ref Client client, const string nickname) @safe {
 		import std.format : format;
-		sendNumeric(client, 5, "are supported by this server");
+		sendNumeric(client, nickname, 2, format!"Your host is %s, running version %s"(serverName, serverVersion));
 	}
-	void sendRPLNamreply(ref Client client, const ServerChannel channel) @safe {
+	void sendRPLCreated(ref Client client, const string nickname) @safe {
+		import std.format : format;
+		sendNumeric(client, nickname, 3, format!"This server was created %s"(serverCreatedTime));
+	}
+	void sendRPLMyInfo(ref Client client, const string nickname) @safe {
+		import std.format : format;
+		sendNumeric(client, nickname, 4, format!"%s %s %s"(serverName, serverVersion, "abcdefghijklmnopqrstuvwxyz"));
+	}
+	void sendRPLISupport(ref Client client, const string nickname) @safe {
+		import std.format : format;
+		sendNumeric(client, nickname, 5, "are supported by this server");
+	}
+	void sendRPLNamreply(ref User user, const Channel channel) @safe {
 		import std.algorithm.iteration : map;
 		import std.format : format;
-		sendNumeric(client, 353, ["=", channel.name, format!"%-(%s %)"(channel.users.map!(x => connections[x].mask.nickname))]);
+		sendNumeric(user, 353, ["=", channel.name, format!"%-(%s %)"(channel.users.map!(x => connections[x].mask.nickname))]);
 	}
-	void sendRPLEndOfNames(ref Client client, string channel) @safe {
+	void sendRPLEndOfNames(ref User user, string channel) @safe {
 		import std.format : format;
-		sendNumeric(client, 366, [channel, "End of /NAMES list"]);
+		sendNumeric(user, 366, [channel, "End of /NAMES list"]);
 	}
-	void sendERRNoSuchChannel(ref Client client, string channel) @safe {
+	void sendERRNoSuchChannel(ref User user, string channel) @safe {
 		import std.format : format;
-		sendNumeric(client, 403, [channel, "No such channel"]);
+		sendNumeric(user, 403, [channel, "No such channel"]);
 	}
-	void sendERRNicknameInUse(ref Client client, string nickname) @safe {
+	void sendERRInvalidCapCmd(ref Client client, const string nickname, string cmd) @safe {
 		import std.format : format;
-		sendNumeric(client, 433, [nickname, "Nickname is already in use"]);
+		sendNumeric(client, nickname, 410, [cmd, "Invalid CAP command"]);
 	}
-	void sendNumeric(ref Client client, ushort id, string[] args) @safe {
+	void sendERRNicknameInUse(ref User user, string nickname) @safe {
 		import std.format : format;
+		sendNumeric(user, 433, [nickname, "Nickname is already in use"]);
+	}
+	void sendNumeric(ref User user, ushort id, string[] args...) @safe {
 		auto ircMessage = IRCMessage();
-		ircMessage.source = networkAddress;
-		ircMessage.verb = format!"%03d"(id);
-		ircMessage.args = client.mask.nickname~args;
-		client.send(ircMessage);
+		ircMessage.args = user.mask.nickname~args;
+		sendNumericCommon(user, id, ircMessage);
 	}
-	void sendNumeric(ref Client client, ushort id, string arg) @safe {
-		import std.format : format;
+	void sendNumeric(ref Client client, const string nickname, ushort id, string[] args...) @safe {
 		auto ircMessage = IRCMessage();
-		ircMessage.source = networkAddress;
-		ircMessage.verb = format!"%03d"(id);
-		ircMessage.args = [client.mask.nickname, arg];
-		client.send(ircMessage);
+		ircMessage.args = nickname~args;
+		sendNumericCommon(client, id, ircMessage);
 	}
-	Client* getUserByNickname(string nickname) @safe {
-		foreach (id, client; connections) {
-			if (client.mask.nickname == nickname) {
+	void sendNumericCommon(T)(ref T target, const ushort id, IRCMessage message) {
+		import std.format : format;
+		message.source = networkAddress;
+		message.verb = format!"%03d"(id);
+		target.send(message);
+	}
+	User* getUserByNickname(string nickname) @safe {
+		foreach (id, user; connections) {
+			if (user.mask.nickname == nickname) {
 				return id in connections;
 			}
 		}
@@ -372,7 +562,13 @@ struct VIRCd {
 		yes,
 		illegalChannel
 	}
-	auto couldUserJoin(ref Client client, string channel) @safe {
+	auto couldUserJoin(ref User user, string channel) @safe {
 		return JoinAttemptResult.yes;
 	}
+}
+
+@safe unittest {
+	auto ircd = VIRCd();
+	ircd.init();
+	ircd.addChannel("#test");
 }
