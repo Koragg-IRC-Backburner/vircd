@@ -9,40 +9,53 @@ import vibe.stream.tls;
 
 import vircd.server;
 
-void setupSocket(ref VIRCd instance) {
+import siryul;
+
+void setupSocket(ref VIRCd instance, const ushort port) @safe {
 	auto sslctx = createTLSContext(TLSContextKind.server);
 	sslctx.useCertificateChainFile("server.crt");
 	sslctx.usePrivateKeyFile("server.key");
-	listenTCP(6697, delegate void(TCPConnection conn) @trusted nothrow {
+	listenTCP(port, delegate void(TCPConnection conn) @safe nothrow {
 		try {
 			auto stream = createTLSStream(conn, sslctx);
 			instance.handleStream(stream, conn.remoteAddress.toAddressString);
-		} catch (Throwable e) {
-			logInfo("ERROR: %s", e);
+		} catch (Exception e) {
+			debug logInfo("ERROR: %s", e);
 		}
 	});
 }
 
-void setupWebSocket(ref VIRCd instance) {
+void setupWebSocket(ref VIRCd instance, string[] addresses, string[] paths, const ushort port) @safe {
 	import vibe.http.router;
-	auto router = new URLRouter;
-	router.get("/irc", handleWebSockets(delegate void(scope WebSocket socket) {
+	auto dg = delegate void(scope WebSocket socket) {
 		instance.handleStream(socket, socket.request.clientAddress.toAddressString);
-	}));
+	};
+	auto router = new URLRouter;
+	foreach (path; paths) {
+		router.get(path, handleWebSockets(dg));
+	}
 	auto settings = new HTTPServerSettings;
-	settings.port = 8080;
-	settings.bindAddresses = ["::1", "127.0.0.1"];
+	settings.port = port;
+	settings.bindAddresses = addresses;
 	listenHTTP(settings, router);
 }
 
 void main() {
+	import std.file : exists;
+	if (!exists("settings.yml")) {
+		toFile!YAML(Settings(), "settings.yml");
+		stderr.writeln("Please edit settings.yml");
+		return;
+	}
+	auto settings = fromFile!(Settings, YAML)("settings.yml");
+	setLogLevel(settings.verboseLogging ? LogLevel.debugV : LogLevel.info);
 	VIRCd instance;
-	instance.init();
+	instance.init(settings);
 	runTask({
-		setupSocket(instance);
+		setupSocket(instance, settings.tcpPort);
 	});
 	runTask({
-		setupWebSocket(instance);
+		setupWebSocket(instance, settings.webSocketBindAddresses, settings.webSocketPaths, settings.webSocketPort);
 	});
 	runEventLoop();
 }

@@ -1,6 +1,7 @@
 module vircd.server;
 
 import std.datetime.systime;
+import std.base64 : Base64;
 
 import vibe.core.log;
 import vibe.core.stream;
@@ -22,13 +23,18 @@ struct Client {
 	bool waitForCapEnd;
 	bool supportsCap302;
 	bool supportsCapNotify;
-	this(WebSocket socket) @safe {
+	bool supportsEcho;
+	bool isAuthenticating;
+	string address;
+	this(WebSocket socket, string addr) @safe {
 		usingWebSocket = true;
 		webSocket = socket;
+		address = addr;
 	}
-	this(Stream socket) @safe {
+	this(Stream socket, string addr) @safe {
 		usingWebSocket = false;
 		stream = socket;
+		address = addr;
 	}
 	string receive() @safe {
 		import std.string : assumeUTF;
@@ -39,7 +45,7 @@ struct Client {
 		}
 	}
 	void send(const IRCMessage message) @safe {
-		logDebugV("Sending message: %s", message.toString());
+		logDebugV("-> %s", message.toString());
 		if (usingWebSocket) {
 			webSocket.send(message.toString());
 		} else {
@@ -64,7 +70,6 @@ struct User {
 	string account;
 	Client[string] clients;
 	SysTime connected;
-	string defaultHost;
 	UserMask mask;
 	string realname;
 	bool isAnonymous = true;
@@ -75,7 +80,9 @@ struct User {
 	}
 	void send(const IRCMessage message) @safe {
 		foreach (client; clients) {
-			client.send(message);
+			if (message.sourceUser.isNull || client.supportsEcho || (message.sourceUser == asVIRCUser)) {
+				client.send(message);
+			}
 		}
 	}
 	bool shouldCleanup() @safe const {
@@ -88,6 +95,15 @@ struct User {
 	auto id() @safe const {
 		return isAnonymous ? randomID : account;
 	}
+	auto asVIRCUser() @safe const {
+		return VIRCUser(mask);
+	}
+}
+
+struct Account {
+	string id;
+	// this is wildly insecure, hooray
+	string password;
 }
 
 struct Channel {
@@ -101,56 +117,85 @@ struct Channel {
 	}
 }
 
+struct Settings {
+	Account[] accounts;
+	string networkName = "Unnamed";
+	string serverName = "Unknown";
+	string canonicalAddress = "localhost";
+	ushort tcpPort = 6697;
+	ushort webSocketPort = 8080;
+	string[] webSocketBindAddresses = ["::1", "127.0.0.1"];
+	string[] webSocketPaths = ["/irc"];
+	bool verboseLogging = false;
+}
+
 struct VIRCd {
 	import virc.ircv3.base : Capability;
 	User[string] connections;
 	Channel[string] channels;
-	string networkName = "Unnamed";
-	string serverName = "Unknown";
+	string networkName = "Null";
+	string serverName = "Null";
 	string serverVersion = "v0.0.0";
 	string networkAddress = "localhost";
+	VIRCUser networkUser;
+	string modePrefixes = "@%+";
+	string channelPrefixes = "#";
+	string userModes;
+	string channelModes;
 	Capability[] supportedCaps = [
-		Capability("cap-notify", "")
+		Capability("cap-notify", ""),
+		Capability("echo-message", ""),
+		Capability("sasl", "PLAIN")
 	];
 	SysTime serverCreatedTime;
 
-	void init() @safe {
+	Account[string] accounts;
+
+	void init(Settings settings) @safe {
 		serverCreatedTime = Clock.currTime;
+		foreach (account; settings.accounts) {
+			accounts[account.id] = account;
+		}
+		networkName = settings.networkName;
+		serverName = settings.serverName;
+		networkAddress = settings.canonicalAddress;
+		networkUser = VIRCUser(networkAddress);
 	}
 
 	void handleStream(Stream stream, string address) @safe {
-		handleStream(Client(stream), address);
+		handleStream(Client(stream, address));
 	}
 	void handleStream(WebSocket stream, string address) @safe {
-		handleStream(Client(stream), address);
+		handleStream(Client(stream, address));
 	}
-	void handleStream(Client client, string address) @safe {
+	void handleStream(Client client) @safe {
 		import std.conv : text;
 		import std.random : uniform;
 		auto randomID = uniform!ulong().text;
 		client.id = randomID;
+		string lastID = randomID;
 		auto user = new User(randomID, client);
-		user.defaultHost = address;
+		user.mask.host = client.address;
 
-		logInfo("User connected: %s/%s", address, randomID);
+		logInfo("User connected: %s/%s", client.address, randomID);
+
+		scope(exit) cleanup(user.id, randomID, "Connection reset by peer");
 
 		while (client.hasMoreData) {
 			receive(client.receive(), *user, client);
-			if (user.id != randomID) {
+			if (client.registered && (user.id != lastID)) {
 				user = user.id in connections;
 				client = user.clients[randomID];
+				lastID = user.id;
 			}
 		}
-		cleanup(user.id, randomID, "Connection reset by peer");
 	}
 	void cleanup(string id, string clientID, string message) @safe {
 		logInfo("Client disconnected: %s: %s", id, message);
 		if (id in connections) {
 			connections[id].clients.remove(clientID);
 			if (connections[id].shouldCleanup) {
-				foreach (otherUser; subscribedUsers(Target(VIRCUser(connections[id].mask.nickname)))) {
-					sendQuit(*otherUser, connections[id], message);
-				}
+				sendToTarget(Target(VIRCUser(connections[id].mask.nickname)), createQuit(connections[id], message));
 				if (!connections.remove(id)) {
 					logWarn("Could not remove ID from connection list?");
 				}
@@ -162,8 +207,14 @@ struct VIRCd {
 	void receive(string str, ref User thisUser, ref Client thisClient) @safe {
 		import std.algorithm.iteration : map;
 		import std.algorithm.searching : canFind;
+		import std.conv : text;
 		import virc.ircmessage : IRCMessage;
+		logDebugV("<- %s", str);
 		auto msg = IRCMessage.fromClient(str);
+		const myNickname = thisClient.registered ? thisUser.mask.nickname : "*";
+		void reply(const IRCMessage msg) {
+			thisClient.send(msg);
+		}
 		switch(msg.verb) {
 			case "CAP":
 				auto args = msg.args;
@@ -178,10 +229,10 @@ struct VIRCd {
 							thisClient.supportsCap302 = true;
 						}
 						thisClient.waitForCapEnd = true;
-						sendCapList(thisClient, thisClient.registered ? thisUser.mask.nickname : "*", "LS");
+						sendCapList(thisClient, myNickname, "LS");
 						break;
 					case "LIST":
-						sendCapList(thisClient, thisClient.registered ? thisUser.mask.nickname : "*", "LIST");
+						sendCapList(thisClient, myNickname, "LIST");
 						break;
 					case "REQ":
 						Capability[] caps;
@@ -194,14 +245,19 @@ struct VIRCd {
 							caps ~= clientCap;
 						}
 						if (reject) {
-							sendCapNAK(thisClient, thisClient.registered ? thisUser.mask.nickname : "*", args.front);
+							reply(createCapNAK(myNickname, args.front));
 						} else {
-							sendCapACK(thisClient, thisClient.registered ? thisUser.mask.nickname : "*", args.front);
+							reply(createCapACK(myNickname, args.front));
 						}
 						foreach (cap; caps) {
 							switch (cap) {
 								case "cap-notify":
 									thisClient.supportsCapNotify = !cap.isDisabled;
+									break;
+								case "echo-message":
+									thisClient.supportsEcho = !cap.isDisabled;
+									break;
+								case "sasl":
 									break;
 								default: assert(0, "Unsupported CAP ACKed???");
 							}
@@ -214,8 +270,62 @@ struct VIRCd {
 						}
 						break;
 					default:
-						sendERRInvalidCapCmd(thisClient, thisClient.registered ? thisUser.mask.nickname : "*", subCommand);
+						reply(createERRInvalidCapCmd(myNickname, subCommand));
 					break;
+				}
+				break;
+			case "AUTHENTICATE":
+				auto args = msg.args;
+				if (args.empty) {
+					break;
+				}
+				const subCommand = args.front;
+				args.popFront();
+				switch (subCommand) {
+					case "PLAIN":
+						reply(createMessage(networkUser, "AUTHENTICATE", "+"));
+						thisClient.isAuthenticating = true;
+						break;
+					default:
+						if (thisClient.isAuthenticating) {
+							auto decoded = Base64.decode(subCommand).splitter(0);
+							if (decoded.empty) {
+								reply(createERRSASLFail(myNickname));
+								break;
+							}
+							string authcid = cast(string)decoded.front.idup;
+							decoded.popFront();
+							if (decoded.empty) {
+								reply(createERRSASLFail(myNickname));
+								break;
+							}
+							string authzid = cast(string)decoded.front.idup;
+							decoded.popFront();
+							if (decoded.empty) {
+								reply(createERRSASLFail(myNickname));
+								break;
+							}
+							string password = cast(string)decoded.front.idup;
+							string account = authzid;
+							bool correct;
+							if (auto acc = account in accounts) {
+								if (acc.password == password) {
+									correct = true;
+								}
+							}
+							if (correct) {
+								thisUser.account = account;
+								thisUser.isAnonymous = false;
+								reply(createRPLLoggedIn(myNickname, thisUser.mask, account));
+								reply(createRPLSASLSuccess(myNickname));
+							} else {
+								reply(createERRSASLFail(myNickname));
+							}
+							thisClient.isAuthenticating = false;
+						} else {
+							reply(createRPLSASLMechs(myNickname));
+						}
+						break;
 				}
 				break;
 			case "NICK":
@@ -223,14 +333,12 @@ struct VIRCd {
 				auto currentNickname = thisUser.mask.nickname;
 				if (auto alreadyUsed = getUserByNickname(nickname)) {
 					if (alreadyUsed.id != thisUser.id) {
-						sendERRNicknameInUse(thisUser, nickname);
+						reply(createERRNicknameInUse(myNickname, nickname));
 						break;
 					}
 				}
 				if (thisClient.registered) {
-					foreach (otherUser; subscribedUsers(Target(VIRCUser(currentNickname)))) {
-						sendNickChange(*otherUser, thisUser, nickname);
-					}
+					sendToTarget(Target(VIRCUser(currentNickname)), createNickChange(thisUser, nickname));
 				}
 				thisUser.mask.nickname = nickname;
 				thisClient.sentNICK = true;
@@ -255,6 +363,19 @@ struct VIRCd {
 					completeRegistration(thisClient, thisUser);
 				}
 				break;
+			case "USERHOST":
+				auto args = msg.args;
+				if (args.empty) {
+					reply(createERRNeedMoreParams(myNickname, msg.verb));
+					break;
+				}
+				auto targets = args.front.splitter(",");
+				foreach (target; targets) {
+					if (auto user = getUserByNickname(target)) {
+						reply(createRPLUserhost(myNickname, *user));
+					}
+				}
+				break;
 			case "QUIT":
 				cleanup(thisUser.id, thisClient.id, msg.args.front);
 				break;
@@ -264,10 +385,8 @@ struct VIRCd {
 				}
 				void joinChannel(ref Channel channel) @safe {
 					channel.users ~= thisUser.id;
-					foreach (otherUser; subscribedUsers(Target(VIRCChannel(channel.name)))) {
-						sendJoin(*otherUser, thisUser, channel.name);
-					}
-					sendNames(thisUser, channel);
+					sendToTarget(Target(VIRCChannel(channel.name)), createJoin(thisUser, channel.name));
+					sendNames(thisClient, myNickname, channel);
 				}
 				auto channelsToJoin = msg.args.front.splitter(",");
 				foreach (channel; channelsToJoin) {
@@ -280,7 +399,7 @@ struct VIRCd {
 							joinChannel(channels.require(channel, Channel(channel)));
 							break;
 						case JoinAttemptResult.illegalChannel:
-							sendERRNoSuchChannel(thisUser, channel);
+							reply(createERRNoSuchChannel(myNickname, channel));
 							continue;
 					}
 				}
@@ -290,21 +409,11 @@ struct VIRCd {
 					break;
 				}
 				auto args = msg.args;
-				auto targets = args.front.splitter(",");
+				auto targets = args.front.splitter(",").map!(x => Target(x, modePrefixes, channelPrefixes));
 				args.popFront();
 				auto message = args.front;
 				foreach (target; targets) {
-					if (auto user = getUserByNickname(target)) {
-						sendPrivmsg(*user, thisUser, target, message);
-					} else {
-						if (target in channels) {
-							foreach (otherUser; subscribedUsers(Target(VIRCChannel(channels[target].name)))) {
-								if (otherUser.id != thisUser.id) {
-									sendPrivmsg(*otherUser, thisUser, target, message);
-								}
-							}
-						}
-					}
+					sendToTarget(target, createPrivmsg(thisUser, target, message));
 				}
 				break;
 			case "NOTICE":
@@ -312,21 +421,18 @@ struct VIRCd {
 					break;
 				}
 				auto args = msg.args;
-				auto targets = args.front.splitter(",");
+				auto targets = args.front.splitter(",").map!(x => Target(x, modePrefixes, channelPrefixes));
 				args.popFront();
 				auto message = args.front;
 				foreach (target; targets) {
-					if (auto user = getUserByNickname(target)) {
-						sendNotice(*user, thisUser, target, message);
-					} else {
-						if (target in channels) {
-							foreach (otherUser; subscribedUsers(Target(VIRCChannel(channels[target].name)))) {
-								if (otherUser.id != thisUser.id) {
-									sendNotice(*otherUser, thisUser, target, message);
-								}
-							}
-						}
-					}
+					sendToTarget(target, createNotice(thisUser, target, message));
+				}
+				break;
+			case "PING":
+				if (!msg.args.empty) {
+					reply(createMessage(thisUser, "PONG", networkUser.text, msg.args.front));
+				} else {
+					reply(createMessage(thisUser, "PONG", networkUser.text));
 				}
 				break;
 			default:
@@ -338,17 +444,27 @@ struct VIRCd {
 		in(client.meetsRegistrationRequirements, "Client does not meet registration requirements yet")
 		in(!client.registered, "Client already registered")
 	{
-		user.mask.host = user.defaultHost;
+		import std.algorithm.searching : canFind;
 		client.registered = true;
 		connections.require(user.id, user);
 		connections[user.id].clients[user.randomID] = client;
-		sendRPLWelcome(client, user.mask.nickname);
-		sendRPLYourHost(client, user.mask.nickname);
-		sendRPLCreated(client, user.mask.nickname);
-		sendRPLMyInfo(client, user.mask.nickname);
-		sendRPLISupport(client, user.mask.nickname);
+		client.send(createRPLWelcome(user.mask.nickname));
+		client.send(createRPLYourHost(user.mask.nickname));
+		client.send(createRPLCreated(user.mask.nickname));
+		client.send(createRPLMyInfo(user.mask.nickname));
+		client.send(createRPLISupport(user.mask.nickname));
+		foreach (channel; channels) {
+			if (!channel.users.canFind(user.id)) {
+				continue;
+			}
+			client.send(createJoin(user, channel.name));
+			sendNames(client, user.mask.nickname, channel);
+		}
+		if (user.mask.nickname != connections[user.id].mask.nickname) {
+			client.send(createNickChange(user, connections[user.id].mask.nickname));
+		}
 	}
-	auto subscribedUsers(Target target) @safe {
+	auto subscribedUsers(const Target target) @safe {
 		import std.algorithm.searching : canFind;
 		User*[] result;
 		if (target.isChannel) {
@@ -373,53 +489,43 @@ struct VIRCd {
 						}
 					}
 				}
+				if (result.length == 0) {
+					result ~= id in connections;
+				}
 			}
 		}
 		return result;
 	}
-	void sendNames(ref User user, const Channel channel) @safe {
-		sendRPLNamreply(user, channel);
-		sendRPLEndOfNames(user, channel.name);
+	void sendNames(ref Client client, const string nickname, const Channel channel) @safe {
+		client.send(createRPLNamreply(nickname, channel));
+		client.send(createRPLEndOfNames(nickname, channel.name));
 	}
-	void sendNickChange(ref User user, const User subject, string newNickname) @safe {
-		import std.conv : text;
-		auto ircMessage = IRCMessage();
-		ircMessage.source = subject.mask.text;
-		ircMessage.verb = "NICK";
-		ircMessage.args = newNickname;
-		user.send(ircMessage);
+	auto createMessage(const User subject, string verb, string[] args...) @safe {
+		return createMessage(subject.asVIRCUser, verb, args);
 	}
-	void sendJoin(ref User user, ref User subject, string channel) @safe {
-		import std.conv : text;
+	auto createMessage(const VIRCUser subject, string verb, string[] args...) @safe {
 		auto ircMessage = IRCMessage();
-		ircMessage.source = subject.mask.text;
-		ircMessage.verb = "JOIN";
-		ircMessage.args = channel;
-		user.send(ircMessage);
+		ircMessage.sourceUser = subject;
+		ircMessage.verb = verb;
+		ircMessage.args = args;
+		return ircMessage;
 	}
-	void sendQuit(ref User user, ref User subject, string msg) @safe {
-		import std.conv : text;
-		auto ircMessage = IRCMessage();
-		ircMessage.source = subject.mask.text;
-		ircMessage.verb = "QUIT";
-		ircMessage.args = msg;
-		user.send(ircMessage);
+	auto createNickChange(const User subject, string newNickname) @safe {
+		return createMessage(subject, "NICK", newNickname);
 	}
-	void sendPrivmsg(ref User user, ref User subject, string target, string message) @safe {
-		import std.conv : text;
-		auto ircMessage = IRCMessage();
-		ircMessage.source = subject.mask.text;
-		ircMessage.verb = "PRIVMSG";
-		ircMessage.args = [target, message];
-		user.send(ircMessage);
+	auto createJoin(ref User subject, string channel) @safe {
+		return createMessage(subject, "JOIN", channel);
 	}
-	void sendNotice(ref User user, ref User subject, string target, string message) @safe {
+	auto createQuit(ref User subject, string msg) @safe {
+		return createMessage(subject, "QUIT", msg);
+	}
+	auto createPrivmsg(ref User subject, Target target, string message) @safe {
 		import std.conv : text;
-		auto ircMessage = IRCMessage();
-		ircMessage.source = subject.mask.text;
-		ircMessage.verb = "NOTICE";
-		ircMessage.args = [target, message];
-		user.send(ircMessage);
+		return createMessage(subject, "PRIVMSG", target.text, message);
+	}
+	auto createNotice(ref User subject, Target target, string message) @safe {
+		import std.conv : text;
+		return createMessage(subject, "NOTICE", target.text, message);
 	}
 	void sendCapList(ref Client client, string nickname, string subCommand) @safe {
 		import std.array : empty;
@@ -430,9 +536,6 @@ struct VIRCd {
 		do {
 			size_t thisLength = 0;
 			size_t numCaps;
-			auto ircMessage = IRCMessage();
-			ircMessage.source = networkAddress;
-			ircMessage.verb = "CAP";
 			foreach (i, cap; capsToSend) {
 				thisLength += cap.name.length + 1;
 				if (client.supportsCap302) {
@@ -460,96 +563,115 @@ struct VIRCd {
 			} else {
 				args ~= capsToSend[0 .. numCaps].map!(x => x.name).join(" ");
 			}
-			ircMessage.args = args;
-			client.send(ircMessage);
+			client.send(createMessage(networkUser, "CAP", args));
 			capsToSend = capsToSend[numCaps .. $];
 		} while(!capsToSend.empty);
 	}
-	void sendCapACK(ref Client client, string nickname, string capList) @safe {
-		auto ircMessage = IRCMessage();
-		ircMessage.source = networkAddress;
-		ircMessage.verb = "CAP";
-		ircMessage.args = [nickname, "ACK", capList];
-		client.send(ircMessage);
+	auto createCapACK(string nickname, string capList) @safe {
+		return createMessage(networkUser, "CAP", nickname, "ACK", capList);
 	}
-	void sendCapNAK(ref Client client, string nickname, string capList) @safe {
-		auto ircMessage = IRCMessage();
-		ircMessage.source = networkAddress;
-		ircMessage.verb = "CAP";
-		ircMessage.args = [nickname, "NAK", capList];
-		client.send(ircMessage);
+	auto createCapNAK(string nickname, string capList) @safe {
+		return createMessage(networkUser, "CAP", nickname, "NAK", capList);
 	}
-	void sendCapNEW(ref User user, string capList) @safe {
-		auto ircMessage = IRCMessage();
-		ircMessage.source = networkAddress;
-		ircMessage.verb = "CAP";
-		ircMessage.args = [user.mask.nickname, "NEW", capList];
-		user.send(ircMessage);
+	auto createCapNEW(string nickname, string capList) @safe {
+		return createMessage(networkUser, "CAP", nickname, "NEW", capList);
 	}
-	void sendCapDEL(ref User user, string capList) @safe {
-		auto ircMessage = IRCMessage();
-		ircMessage.source = networkAddress;
-		ircMessage.verb = "CAP";
-		ircMessage.args = [user.mask.nickname, "NEW", capList];
-		user.send(ircMessage);
+	auto createCapDEL(string nickname, string capList) @safe {
+		return createMessage(networkUser, "CAP", nickname, "DEL", capList);
 	}
-	void sendRPLWelcome(ref Client client, const string nickname) @safe {
+	auto createRPLWelcome(const string nickname) @safe {
 		import std.format : format;
-		sendNumeric(client, nickname, 1, format!"Welcome to the %s Network, %s"(networkName, nickname));
+		return createNumeric(nickname, 1, format!"Welcome to the %s Network, %s"(networkName, nickname));
 	}
-	void sendRPLYourHost(ref Client client, const string nickname) @safe {
+	auto createRPLYourHost(const string nickname) @safe {
 		import std.format : format;
-		sendNumeric(client, nickname, 2, format!"Your host is %s, running version %s"(serverName, serverVersion));
+		return createNumeric(nickname, 2, format!"Your host is %s, running version %s"(serverName, serverVersion));
 	}
-	void sendRPLCreated(ref Client client, const string nickname) @safe {
+	auto createRPLCreated(const string nickname) @safe {
 		import std.format : format;
-		sendNumeric(client, nickname, 3, format!"This server was created %s"(serverCreatedTime));
+		return createNumeric(nickname, 3, format!"This server was created %s"(serverCreatedTime));
 	}
-	void sendRPLMyInfo(ref Client client, const string nickname) @safe {
+	auto createRPLMyInfo(const string nickname) @safe {
 		import std.format : format;
-		sendNumeric(client, nickname, 4, format!"%s %s %s"(serverName, serverVersion, "abcdefghijklmnopqrstuvwxyz"));
+		return createNumeric(nickname, 4, serverName, serverVersion, userModes, channelModes);
 	}
-	void sendRPLISupport(ref Client client, const string nickname) @safe {
+	auto createRPLISupport(const string nickname) @safe {
 		import std.format : format;
-		sendNumeric(client, nickname, 5, "are supported by this server");
+		return createNumeric(nickname, 5, "are supported by this server");
 	}
-	void sendRPLNamreply(ref User user, const Channel channel) @safe {
+	auto createRPLUserhost(const string nickname, const User[] users...) @safe {
+		import std.format : format;
+		string[] args;
+		args.reserve(users.length);
+		foreach (user; users) {
+			bool isAway = false;
+			bool isOper = false;
+			args ~= user.mask.nickname ~ (isOper ? "*" : "") ~ "=" ~ (isAway ? "-" : "+") ~ user.mask.ident ~ "@" ~user.mask.host;
+		}
+		return createNumeric(nickname, 302, args);
+	}
+	auto createRPLNamreply(const string nickname, const Channel channel) @safe {
 		import std.algorithm.iteration : map;
 		import std.format : format;
-		sendNumeric(user, 353, ["=", channel.name, format!"%-(%s %)"(channel.users.map!(x => connections[x].mask.nickname))]);
+		return createNumeric(nickname, 353, ["=", channel.name, format!"%-(%s %)"(channel.users.map!(x => connections[x].mask.nickname))]);
 	}
-	void sendRPLEndOfNames(ref User user, string channel) @safe {
+	auto createRPLEndOfNames(const string nickname, string channel) @safe {
+		return createNumeric(nickname, 366, [channel, "End of /NAMES list"]);
+	}
+	auto createRPLLoggedIn(const string nickname,  UserMask mask, string account) @safe {
+		import std.conv : text;
+		return createNumeric(nickname, 900, mask.text, account, "You are now logged in as "~account);
+	}
+	auto createRPLSASLSuccess(const string nickname) @safe {
+		import std.conv : text;
+		return createNumeric(nickname, 903, "SASL authentication successful");
+	}
+	auto createERRSASLFail(const string nickname) @safe {
+		import std.conv : text;
+		return createNumeric(nickname, 904, "SASL authentication failed");
+	}
+	auto createRPLSASLMechs(const string nickname) @safe {
 		import std.format : format;
-		sendNumeric(user, 366, [channel, "End of /NAMES list"]);
+		return createNumeric(nickname, 908, "PLAIN", "are available SASL mechanisms");
 	}
-	void sendERRNoSuchChannel(ref User user, string channel) @safe {
+	auto createERRNoSuchChannel(const string nickname, string channel) @safe {
 		import std.format : format;
-		sendNumeric(user, 403, [channel, "No such channel"]);
+		return createNumeric(nickname, 403, [channel, "No such channel"]);
 	}
-	void sendERRInvalidCapCmd(ref Client client, const string nickname, string cmd) @safe {
+	auto createERRInvalidCapCmd(const string nickname, string cmd) @safe {
 		import std.format : format;
-		sendNumeric(client, nickname, 410, [cmd, "Invalid CAP command"]);
+		return createNumeric(nickname, 410, [cmd, "Invalid CAP command"]);
 	}
-	void sendERRNicknameInUse(ref User user, string nickname) @safe {
+	auto createERRNicknameInUse(const string nickname, string newNickname) @safe {
 		import std.format : format;
-		sendNumeric(user, 433, [nickname, "Nickname is already in use"]);
+		return createNumeric(nickname, 433, [newNickname, "Nickname is already in use"]);
 	}
-	void sendNumeric(ref User user, ushort id, string[] args...) @safe {
+	auto createERRNeedMoreParams(const string nickname, string command) @safe {
+		import std.format : format;
+		return createNumeric(nickname, 461, [command, "Not enough parameters"]);
+	}
+	auto createNumeric(ref User user, ushort id, string[] args...) @safe {
 		auto ircMessage = IRCMessage();
 		ircMessage.args = user.mask.nickname~args;
-		sendNumericCommon(user, id, ircMessage);
+		return createNumericCommon(id, ircMessage);
 	}
-	void sendNumeric(ref Client client, const string nickname, ushort id, string[] args...) @safe {
+	auto createNumeric(const string nickname, ushort id, string[] args...) @safe {
 		auto ircMessage = IRCMessage();
 		ircMessage.args = nickname~args;
-		sendNumericCommon(client, id, ircMessage);
+		return createNumericCommon(id, ircMessage);
 	}
-	void sendNumericCommon(T)(ref T target, const ushort id, IRCMessage message) {
+	auto createNumericCommon(const ushort id, IRCMessage message) @safe {
 		import std.format : format;
-		message.source = networkAddress;
+		message.sourceUser = networkUser;
 		message.verb = format!"%03d"(id);
-		target.send(message);
+		return message;
 	}
+	void sendToTarget(Target target, const IRCMessage message) @safe {
+		foreach (otherUser; subscribedUsers(target)) {
+			otherUser.send(message);
+		}
+	}
+
 	User* getUserByNickname(string nickname) @safe {
 		foreach (id, user; connections) {
 			if (user.mask.nickname == nickname) {
@@ -569,6 +691,6 @@ struct VIRCd {
 
 @safe unittest {
 	auto ircd = VIRCd();
-	ircd.init();
+	ircd.init(Settings());
 	ircd.addChannel("#test");
 }
